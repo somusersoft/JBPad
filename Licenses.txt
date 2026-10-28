@@ -1,0 +1,160 @@
+JBPad 1.0 — Third-Party Licenses and Notices
+
+JBPad is free and open-source software released under the GNU General
+Public License, version 3 (GPLv3).
+
+Copyright © 2026 Олег Любошенко (somuser)
+
+JBPad source code: https://github.com/somusersoft/JBPad
+
+JBPad downloads: https://somuser.org/downloads/
+
+1. GNU General Public License v3
+
+JBPad itself is licensed under the GNU GPLv3.
+
+The complete license text is provided in the file:
+
+    LICENSE
+
+Official license: https://www.gnu.org/licenses/gpl-3.0.html
+
+2. GNU Lesser General Public License v3
+
+The distribution includes the GNU LGPLv3 text because Qt 5 used by the
+PyQt5 wheels is provided under LGPLv3, and the LGPLv3 text incorporates
+the terms of GPLv3 with additional permissions.
+
+The complete license text is provided in the file:
+
+    LGPL-3.0.txt
+
+Official license: https://www.gnu.org/licenses/lgpl-3.0.html
+
+3. PyQt5
+
+PyQt5 is developed by Riverbank Computing.
+
+Version used by the Windows builds: PyQt5 5.15.11 on Windows 10+ PyQt5
+5.15.2 on Windows 7
+
+Version used by the Linux and macOS builds: PyQt5 5.15.11
+
+PyQt5 is dual licensed under the GNU GPLv3 and the Riverbank Commercial
+License. JBPad is distributed under GPLv3, so the GPL version of PyQt5
+is used.
+
+Official information:
+https://www.riverbankcomputing.com/software/pyqt/intro
+
+4. Qt 5
+
+JBPad uses the Qt 5 libraries supplied with PyQt5.
+
+Windows builds: Qt 5.15.2
+
+Linux and macOS builds: Qt 5.15.14
+
+The Qt libraries used by these builds are available under the LGPLv3 and
+contain third-party components distributed under their respective
+licenses.
+
+Qt’s official list of licenses and third-party components:
+https://doc.qt.io/qt-5.15/licenses-used-in-qt.html
+
+Only Qt components actually included in a particular JBPad build are
+relevant to that build. JBPad does not use or distribute Qt
+WebEngine/Chromium components.
+
+5. Python
+
+JBPad is built with Python.
+
+Python versions used for the release builds: Windows 7: Python 3.8.10
+Windows 10+: Python 3.11.9 Linux: Python 3.12.3 macOS: Python 3.11.15
+
+Python and its standard library are distributed under the Python
+Software Foundation license and related licenses applicable to
+incorporated portions of Python.
+
+Official information: https://www.python.org/about/legal/
+https://www.python.org/psf/summary/
+
+6. PyInstaller
+
+JBPad release executables are packaged with PyInstaller.
+
+Versions used: Windows: PyInstaller 6.18.0 Linux: PyInstaller 6.22.0
+macOS: PyInstaller 6.22.0
+
+PyInstaller is licensed under the GNU GPLv2 with a special exception for
+generated applications, subject to the terms of that exception and the
+licenses of bundled dependencies.
+
+Official information: https://pyinstaller.org/en/stable/license.html
+
+7. OpenSSL
+
+Some release builds contain OpenSSL libraries supplied by the Python or
+Qt runtime.
+
+Windows builds may contain: OpenSSL 1.1.1 libraries supplied with Qt
+OpenSSL 3 libraries supplied with Python 3
+
+Linux and macOS builds contain: OpenSSL 3 libraries
+
+OpenSSL 3 is licensed under the Apache License 2.0. Older OpenSSL 1.1.1
+releases use the older OpenSSL/SSLeay licensing terms.
+
+Official information: https://www.openssl.org/
+
+8. Qt third-party components
+
+Qt 5 contains third-party components under licenses other than the Qt
+LGPLv3 license. Depending on the platform and Qt modules/plugins
+included in a JBPad build, these can include components such as:
+
+    FreeType
+    HarfBuzz
+    libjpeg-turbo
+    libpng
+    libtiff
+    libwebp
+    zlib
+    PCRE2
+    ICU / Unicode data
+    XCB / X11 related components
+    Wayland protocol components
+    D-Bus headers
+    Qt QML JavaScriptCore Macro Assembler
+    other third-party components listed by Qt for the corresponding Qt release
+
+Each component remains under its own license. The authoritative license
+texts and notices are provided by the Qt project.
+
+Official Qt license list:
+https://doc.qt.io/qt-5.15/licenses-used-in-qt.html
+
+Qt 5.15 license changes by release: https://wiki.qt.io/Qt_5.15.14
+
+9. Important distribution note
+
+This file is a notice and attribution document. It does not replace the
+original license terms of the third-party software.
+
+The files LICENSE and LGPL-3.0.txt included with JBPad contain the
+complete GNU GPLv3 and GNU LGPLv3 texts.
+
+Third-party software remains copyrighted by its respective copyright
+holders and is licensed under the terms applicable to that software.
+
+For the exact contents of a particular platform build, consult the
+corresponding bundled runtime files and the official license information
+for the versions listed above.
+
+10. Source and license information
+
+JBPad source code: https://github.com/somusersoft/JBPad
+
+JBPad downloads and future release materials:
+https://somuser.org/downloads/
