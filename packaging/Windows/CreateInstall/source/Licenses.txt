@@ -7,7 +7,7 @@ Copyright © 2026 Олег Любошенко (somuser)
 
 JBPad source code: https://github.com/somusersoft/JBPad
 
-JBPad downloads: https://somuser.org/downloads/
+JBPad downloads: https://somuser.org/downloads.html
 
 1. GNU General Public License v3
 
