@@ -31,7 +31,7 @@
 | Цель            | Проверенное окружение                                                                     |
 | --------------- | ----------------------------------------------------------------------------------------- |
 | Windows 7+ x86  | Windows 7, Python 3.8.10 x86, PyQt5 5.15.2 / Qt 5.15.2, PyInstaller 6.22.3                |
-| Windows 10+ x64 | Windows 10 22H2, Python 3.11.9 x64, PyQt5 5.15.11 / Qt 5.15.2, PyInstaller 6.18.0         |
+| Windows 10+ x64 | Windows 10 22H2, Python 3.11.9 x64, PyQt5 5.15.11 / Qt 5.15.2, PyInstaller 6.22.3         |
 | Linux           | Linux Mint 22.2 x86_64, Python 3.12.3, PyQt5 5.15.11 / Qt 5.15.19, PyInstaller 6.22.0     |
 | macOS           | macOS Ventura 13.2 x86_64, Python 3.11.15, PyQt5 5.15.11 / Qt 5.15.19, PyInstaller 6.22.0 |
 

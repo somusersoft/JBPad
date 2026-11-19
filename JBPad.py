@@ -37,7 +37,7 @@ from PyQt5.QtWidgets import (QApplication, QMainWindow, QTreeWidget, QTreeWidget
                              QStyleOptionTab, QStyleOptionButton, QStyleOption, QStylePainter, QTreeView, QToolTip, QScrollBar,
                              QGridLayout, QSlider, QTextBrowser,
                              QShortcut, QProgressDialog, QColorDialog)
-from PyQt5.QtCore import Qt, QTimer, QRect, QSize, QUrl, QPoint, QMimeData, QEvent, QObject, QThread, QSaveFile, QIODevice, QEventLoop, pyqtSignal, pyqtSlot, QStringListModel, QLockFile
+from PyQt5.QtCore import Qt, QTimer, QRect, QSize, QUrl, QPoint, QMimeData, QEvent, QObject, QThread, QSaveFile, QIODevice, QEventLoop, pyqtSignal, pyqtSlot, QStringListModel, QLockFile, QProcess
 from PyQt5.QtGui import QTextCharFormat, QColor, QStandardItemModel, QStandardItem, QSyntaxHighlighter
 from PyQt5.QtGui import QPainter, QPen, QIcon, QPixmap, QFont, QFontDatabase, QDesktopServices, QCursor, QTextCursor, QDrag, QPalette, QTextDocument, QTextBlockFormat, QTextOption, QKeySequence, QKeyEvent, QMouseEvent, QPolygon, QImage, QLinearGradient, QGuiApplication, QHelpEvent
 from PyQt5.QtWidgets import QAbstractItemView
@@ -2741,6 +2741,286 @@ def disable_spinbox_context_menu(spinbox):
         pass
 
 
+# -------------------------------------------------------
+# Copy-Paste: вставка заранее подготовленных текстовых блоков из системного
+# файла "copy-paste" (корень текущего блокнота) через контекстное меню
+# редактора. Изолированное дополнение, не затрагивающее прочие механизмы.
+# -------------------------------------------------------
+COPY_PASTE_NAME = "copy-paste"
+COPY_PASTE_LABEL_MAX_CHARS = 35
+COPY_PASTE_LABEL_KEEP_CHARS = 34
+COPY_PASTE_LABEL_ELLIPSIS = "\u2026"
+
+
+def _copy_paste_parse_blocks(text):
+    """Разбирает содержимое файла copy-paste на отдельные текстовые блоки.
+
+    Блок — максимальная последовательность подряд идущих непустых строк.
+    Разделителем считается пустая строка, в том числе строка из пробельных
+    символов. Пробелы/табуляции внутри непустых строк сохраняются как есть,
+    порядок блоков сохраняется, повторы не объединяются.
+    """
+    if text is None:
+        return []
+    source = text if isinstance(text, str) else str(text)
+    # Нормализуем переводы строк (файл мог быть сохранён на любой ОС).
+    source = source.replace("\r\n", "\n").replace("\r", "\n")
+    blocks = []
+    current = []
+    for line in source.split("\n"):
+        if line.strip() == "":
+            if current:
+                blocks.append("\n".join(current))
+                current = []
+        else:
+            current.append(line)
+    if current:
+        blocks.append("\n".join(current))
+    return blocks
+
+
+def _copy_paste_block_label(block):
+    """Текст пункта подменю: первая строка блока с обрезкой по правилу 35 знаков."""
+    try:
+        first_line = block.split("\n", 1)[0]
+    except Exception:
+        first_line = ""
+    if len(first_line) > COPY_PASTE_LABEL_MAX_CHARS:
+        return first_line[:COPY_PASTE_LABEL_KEEP_CHARS] + COPY_PASTE_LABEL_ELLIPSIS
+    return first_line
+
+
+class CopyPasteSubMenu(QMenu):
+    """Подменю "copy-paste" с фиксацией модификаторов клика по пункту.
+
+    Штатный QAction.triggered() не сообщает, с какими модификаторами был сделан
+    клик, поэтому подменю запоминает модификаторы события мыши раньше, чем Qt
+    вызовет triggered().
+    """
+
+    def __init__(self, title, parent=None):
+        super().__init__(title, parent)
+        self._click_modifiers = None
+
+    def mousePressEvent(self, event):
+        try:
+            self._click_modifiers = event.modifiers()
+        except Exception:
+            self._click_modifiers = None
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        try:
+            self._click_modifiers = event.modifiers()
+        except Exception:
+            self._click_modifiers = None
+        super().mouseReleaseEvent(event)
+
+    def copy_modifier_pressed(self):
+        """True — по пункту кликнули с Ctrl (Windows/Linux) или Cmd (macOS)."""
+        modifiers = None
+        try:
+            modifiers = self._click_modifiers
+        except Exception:
+            modifiers = None
+        if modifiers is None:
+            # Fallback: опросить текущее состояние клавиатуры.
+            try:
+                modifiers = QApplication.keyboardModifiers()
+            except Exception:
+                modifiers = None
+        if modifiers is None:
+            return False
+        try:
+            # В Qt на macOS Cmd по умолчанию представлен как Qt.ControlModifier.
+            return bool(modifiers & Qt.ControlModifier)
+        except Exception:
+            return False
+
+
+def _copy_paste_find_file_item(main_window):
+    """Item системного файла "copy-paste" в корне текущего блокнота (или None).
+
+    Ищем только среди прямых детей корневого элемента: одноимённые файлы во
+    вложенных папках системными не являются.
+    """
+    root_item = None
+    try:
+        root_item = main_window._tree_root_item()
+    except Exception:
+        root_item = None
+    if root_item is None:
+        return None
+    try:
+        child_count = root_item.childCount()
+    except Exception:
+        return None
+    for index in range(child_count):
+        try:
+            child = root_item.child(index)
+        except Exception:
+            child = None
+        if child is None:
+            continue
+        try:
+            if child.data(0, ROLE_NODE_TYPE) != "file":
+                continue
+            if (child.text(0) or "").strip() != COPY_PASTE_NAME:
+                continue
+        except Exception:
+            continue
+        return child
+    return None
+
+
+def _copy_paste_read_text(main_window, file_item):
+    """Актуальный текст файла copy-paste.
+
+    Если файл открыт во вкладке — берём текст документа в памяти редактора
+    (учитывая ещё не сохранённые изменения), иначе — из кеша данных блокнота.
+    """
+    if file_item is None:
+        return ""
+    editor = None
+    try:
+        editor = main_window.get_open_editor_for_item(file_item)
+    except Exception:
+        editor = None
+    if editor is not None:
+        try:
+            return editor.toPlainText()
+        except Exception:
+            pass
+    content = None
+    try:
+        content = main_window._get_item_content_from_cache(file_item)
+    except Exception:
+        content = None
+    if isinstance(content, list):
+        try:
+            return "".join("" if piece is None else str(piece) for piece in content)
+        except Exception:
+            return ""
+    if content is None:
+        return ""
+    return content if isinstance(content, str) else str(content)
+
+
+def _copy_paste_insert_block(text_editor, block):
+    """Вставляет блок в позицию курсора (заменяя выделение) одной операцией Undo."""
+    if text_editor is None or not block:
+        return
+    try:
+        cursor = text_editor.textCursor()
+        cursor.beginEditBlock()
+        try:
+            cursor.insertText(block)
+        finally:
+            cursor.endEditBlock()
+        # Курсор остаётся сразу после вставленного текста.
+        text_editor.setTextCursor(cursor)
+    except Exception:
+        pass
+
+
+def _copy_paste_open_file(main_window):
+    """Открывает системный файл copy-paste, при его отсутствии — создаёт пустой в корне."""
+    file_item = _copy_paste_find_file_item(main_window)
+    if file_item is None:
+        root_item = None
+        try:
+            root_item = main_window._tree_root_item()
+        except Exception:
+            root_item = None
+        if root_item is None:
+            return
+        try:
+            file_item = QTreeWidgetItem()
+            file_item.setText(0, COPY_PASTE_NAME)
+            file_item.setData(0, ROLE_NODE_TYPE, "file")
+            # Как и у любого нового файла JBPad — пустой текст из newlines_count
+            # пустых строк (текстовых блоков в таком файле нет).
+            initial_content = "\n" * int(getattr(main_window, "newlines_count", 0) or 0)
+            main_window._set_item_content_to_cache(file_item, initial_content, "file")
+            file_item.setIcon(0, get_file_icon("", main_window.style()))
+            file_item.setData(0, ROLE_IS_LINK_FILE, False)
+            file_item.setFlags(
+                Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsEditable |
+                Qt.ItemIsDragEnabled | Qt.ItemIsDropEnabled
+            )
+            root_item.addChild(file_item)
+            root_item.setExpanded(True)
+            try:
+                main_window.on_tree_structure_changed()
+            except Exception:
+                pass
+        except Exception:
+            return
+    try:
+        # Штатный механизм открытия/активации вкладки (открытый файл — активируется).
+        main_window.open_item_in_new_tab(file_item)
+    except Exception:
+        pass
+
+
+def _copy_paste_trigger(main_window, text_editor, submenu, block, on_copy_action=None):
+    """Выбор пункта подменю: Ctrl/Cmd+клик — копировать, обычный клик — вставить."""
+    if submenu is not None:
+        try:
+            if submenu.copy_modifier_pressed():
+                # Ctrl/Cmd+клик: только буфер обмена, редактор не трогаем и
+                # текст не вставляем (ветки взаимоисключающие — без дублирования).
+                try:
+                    QApplication.clipboard().setText(block)
+                except Exception:
+                    pass
+                if on_copy_action is not None:
+                    try:
+                        on_copy_action()
+                    except Exception:
+                        pass
+                return
+        except Exception:
+            pass
+    _copy_paste_insert_block(text_editor, block)
+
+
+def _copy_paste_build_submenu(main_window, text_editor, on_copy_action=None):
+    """Создаёт подменю "copy-paste"; список блоков перечитывается при каждом раскрытии."""
+    submenu = CopyPasteSubMenu(COPY_PASTE_NAME, text_editor)
+
+    def _rebuild():
+        try:
+            submenu.clear()
+        except Exception:
+            pass
+        try:
+            file_item = _copy_paste_find_file_item(main_window)
+            blocks = _copy_paste_parse_blocks(_copy_paste_read_text(main_window, file_item))
+        except Exception:
+            blocks = []
+        if not blocks:
+            placeholder = submenu.addAction("...")
+            placeholder.triggered.connect(
+                lambda checked=False, mw=main_window: _copy_paste_open_file(mw)
+            )
+            return
+        for block in blocks:
+            action = submenu.addAction(_copy_paste_block_label(block))
+            action.triggered.connect(
+                lambda checked=False, mw=main_window, ed=text_editor, menu=submenu,
+                       data=block, cb=on_copy_action: _copy_paste_trigger(mw, ed, menu, data, cb)
+            )
+
+    try:
+        submenu.aboutToShow.connect(_rebuild)
+    except Exception:
+        pass
+    # Первичное наполнение, чтобы подменю не оказалось пустым при первом показе.
+    _rebuild()
+    return submenu
+
+
 class ClickableIconLabel(QLabel):
     """Кликабельная иконка для control_panel"""
     
@@ -4389,7 +4669,7 @@ class ThemedMessageDialog(ThemedFramelessDialog):
 
 # --- About dialog (English only; edit text and URLs here) ---
 _ABOUT_DIALOG_LINES = (
-    "JBPad 1.0",
+    "JBPad 1.1",
     "",
     "Free and open-source software.",
     "License: GNU GPLv3",
@@ -4635,6 +4915,10 @@ class CustomTitleBar(QWidget):
         super().__init__(parent)
         self.main_window = parent
         self._drag_area_left_x = 0
+        # Старт системного перемещения откладывается до первого реального
+        # смещения мыши (порог 1 px), чтобы обычный клик не запускал
+        # move-loop и не ломал обновление курсора редактора.
+        self._pending_drag_start_global = None
         bar_h = int(self.TITLEBAR_HEIGHT_PX)
         icon_px = int(self.TITLE_BAR_ICON_SIZE)
         self.setFixedHeight(bar_h)
@@ -4870,6 +5154,7 @@ class CustomTitleBar(QWidget):
     
     def mousePressEvent(self, event):
         """Перетаскивание окна через QWindow.startSystemMove (Qt 5.15+)."""
+        self._pending_drag_start_global = None
         if event.button() == Qt.LeftButton and self.main_window:
             try:
                 if self.main_window.isMaximized():
@@ -4878,14 +5163,41 @@ class CustomTitleBar(QWidget):
             except Exception:
                 pass
             if self._is_drag_region(event.pos()):
-                if getattr(self.main_window, "frameless_start_system_move", None):
-                    if self.main_window.frameless_start_system_move():
-                        event.accept()
-                        return
+                # Не запускаем move-loop на самом клике. Запоминаем точку и
+                # стартуем только после смещения >= 1 px. На Windows нативный
+                # WM_NCHITTEST -> HTCAPTION обычно забирает событие до Qt,
+                # поэтому эта ветка там выполняется только как fallback.
+                self._pending_drag_start_global = QPoint(event.globalPos())
+                event.accept()
+                return
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        """Запуск перемещения окна после реального смещения мыши на 1 px."""
+        start_global = self._pending_drag_start_global
+        if start_global is not None:
+            if not (event.buttons() & Qt.LeftButton):
+                self._pending_drag_start_global = None
+            else:
+                current_global = event.globalPos()
+                if (current_global.x() != start_global.x()
+                        or current_global.y() != start_global.y()):
+                    self._pending_drag_start_global = None
+                    if self.main_window and getattr(
+                            self.main_window, "frameless_start_system_move", None):
+                        if self.main_window.frameless_start_system_move():
+                            event.accept()
+                            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        """Отпускание мыши: сбрасываем ожидающее перетаскивание."""
+        self._pending_drag_start_global = None
+        super().mouseReleaseEvent(event)
 
     def mouseDoubleClickEvent(self, event):
         """Двойной клик по заголовку: развернуть/восстановить (как в обычном окне)."""
+        self._pending_drag_start_global = None
         try:
             if event.button() == Qt.LeftButton and self.main_window:
                 if self._is_drag_region(event.pos()):
@@ -5384,6 +5696,9 @@ class SmartTreeView(QTreeView):
 class SmartListView(QListView):
     """QListView с tooltip только для визуально обрезанного текста."""
 
+    # Двойной клик по свободному от элементов месту панели (вне элемента списка).
+    emptyAreaDoubleClicked = pyqtSignal()
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setMouseTracking(True)
@@ -5460,6 +5775,21 @@ class SmartListView(QListView):
     def leaveEvent(self, event):
         self._hide_truncation_tooltip()
         super().leaveEvent(event)
+
+    def mouseDoubleClickEvent(self, event):
+        """Двойной клик по свободному от элементов месту панели.
+
+        Свободное место определяется тем, что indexAt() возвращает невалидный
+        индекс (тот же приём, что и в mouseMoveEvent для tooltip'ов).
+        """
+        try:
+            if event.button() == Qt.LeftButton and not self.indexAt(event.pos()).isValid():
+                self.emptyAreaDoubleClicked.emit()
+                event.accept()
+                return
+        except Exception:
+            pass
+        super().mouseDoubleClickEvent(event)
 
 
 class SmartTabBar(QTabBar):
@@ -5702,7 +6032,11 @@ class CustomTabBar(SmartTabBar):
         return False
 
     def mouseDoubleClickEvent(self, event):
-        """Двойной клик по вкладке переключает отметку «* » (не по кнопке ×)."""
+        """Двойной клик по вкладке переключает отметку «* » (не по кнопке ×).
+
+        Двойной клик по свободному от вкладок месту панели вкладок создаёт
+        временный файл (аналог кнопки «Добавить временный файл»).
+        """
         try:
             if event.button() == Qt.LeftButton:
                 tab_index = self.tabAt(event.pos())
@@ -5714,6 +6048,16 @@ class CustomTabBar(SmartTabBar):
                     if main_window is not None and hasattr(main_window, "toggle_tab_mark_at_index"):
                         try:
                             main_window.toggle_tab_mark_at_index(tab_index)
+                            event.accept()
+                            return
+                        except Exception:
+                            pass
+                else:
+                    # Свободное от вкладок место панели вкладок.
+                    main_window = getattr(self, "_jbpad_main_window", None)
+                    if main_window is not None and hasattr(main_window, "add_temp_file"):
+                        try:
+                            main_window.add_temp_file()
                             event.accept()
                             return
                         except Exception:
@@ -7509,6 +7853,8 @@ class FavoritesBarSandbox(QWidget):
     # Сигналы для взаимодействия с внешним кодом
     favoriteActivated = pyqtSignal(object)  # path: str
     favoriteRemoved = pyqtSignal(str)  # path: str
+    # Двойной клик по свободному от вкладок месту панели избранного
+    emptyAreaDoubleClicked = pyqtSignal()
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -7576,6 +7922,9 @@ class FavoritesBarSandbox(QWidget):
         
         # Открытие элемента делаем через стандартный сигнал clicked (устойчивее, чем editorEvent делегата)
         self.list_view.clicked.connect(self._on_item_clicked)
+
+        # Проброс двойного клика по свободному месту панели избранного наружу.
+        self.list_view.emptyAreaDoubleClicked.connect(self.emptyAreaDoubleClicked)
         
         # Модель будет заполнена при загрузке настроек через load_settings
         # Пока оставляем пустой список
@@ -8138,10 +8487,78 @@ def url_for_open(url: str) -> str:
 
 
 def open_url_in_browser(url: str) -> bool:
-    """Открывает URL в браузере по умолчанию. Возвращает True при успешном вызове."""
+    """Открывает URL во внешнем приложении. Возвращает True при успешном вызове."""
     open_target = url_for_open(url)
     if not open_target:
         return False
+    if _is_linux_wayland_session():
+        return _open_url_wayland(open_target)
+    try:
+        return bool(QDesktopServices.openUrl(QUrl(open_target)))
+    except Exception:
+        return False
+
+
+_PORTAL_OPEN_URI_IFACE = "org.freedesktop.portal.OpenURI"
+
+
+def _portal_open_uri_available() -> bool:
+    """True, если xdg-desktop-portal OpenURI доступен в текущей сессии."""
+    if not sys.platform.startswith("linux"):
+        return False
+    try:
+        bus = QDBusConnection.sessionBus()
+        if not bus.isConnected():
+            return False
+        portal = QDBusInterface(_PORTAL_BUS, _PORTAL_PATH, _PORTAL_OPEN_URI_IFACE, bus)
+        return portal.isValid()
+    except Exception:
+        return False
+
+
+def _open_url_via_portal(open_target: str) -> bool:
+    """Wayland: открытие через xdg-desktop-portal OpenURI (DE-агностично, без xdg-open)."""
+    if not _portal_open_uri_available():
+        return False
+    try:
+        bus = QDBusConnection.sessionBus()
+        portal = QDBusInterface(_PORTAL_BUS, _PORTAL_PATH, _PORTAL_OPEN_URI_IFACE, bus)
+        parent_window = _portal_parent_window_handle(QApplication.activeWindow())
+        # asyncCall: не блокируем UI внутри обработчика мыши; ответ (handle) не нужен.
+        portal.asyncCall("OpenURI", parent_window, open_target, {"activate": True})
+        return True
+    except Exception:
+        return False
+
+
+def _open_url_via_launcher(open_target: str) -> bool:
+    """Резерв: те же лаунчеры, что ищет Qt, но запускаем сами через QProcess.startDetached."""
+    candidates = (
+        ("xdg-open", [open_target]),
+        ("gio", ["open", open_target]),
+        ("kde-open5", [open_target]),
+        ("gnome-open", [open_target]),
+        ("exo-open", [open_target]),
+        ("sensible-browser", [open_target]),
+    )
+    for program, args in candidates:
+        if not shutil.which(program):
+            continue
+        try:
+            started, _pid = QProcess.startDetached(program, args)
+            if started:
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _open_url_wayland(open_target: str) -> bool:
+    """Wayland-ветка: портал OpenURI → внешние лаунчеры → Qt как последний шанс."""
+    if _open_url_via_portal(open_target):
+        return True
+    if _open_url_via_launcher(open_target):
+        return True
     try:
         return bool(QDesktopServices.openUrl(QUrl(open_target)))
     except Exception:
@@ -8592,6 +9009,10 @@ class TextEditor(QTextEdit):
         self._saved_selection = None  # Сохраненное выделение (start, end)
         self._preserve_selection_focus = False  # Активный цвет выделения при ПКМ/меню (см. apply_selection_appearance)
         self._selection_force_active = False  # Принудительно активный цвет (меню, диалог, DnD)
+        # URL, нажатый в тексте (только Windows): открывается на mouseRelease,
+        # чтобы внешнее приложение не активировалось до отпускания кнопки.
+        # На Linux/Wayland открытие идёт сразу в mousePressEvent.
+        self._pending_link_url = None
 
         # ------------------------------------------------------------
         # Комбинации кнопок мыши для переключения вкладок (внутри QTextEdit)
@@ -8768,6 +9189,57 @@ class TextEditor(QTextEdit):
                 self.setCursor(cursor_shape)
             except Exception:
                 pass
+
+    def _refresh_editor_mouse_cursor(self):
+        """Пересчитывает курсор редактора по текущей позиции указателя.
+
+        Нужно после возврата в окно (QEvent.WindowActivate): WindowDeactivate
+        ставит редакторам ArrowCursor, а на Wayland Enter/mouseMove после
+        возврата может не прийти — курсор «залипал» бы стрелкой до первого
+        движения мыши. Решение повторяет логику mouseMoveEvent.
+        """
+        default_shape = Qt.IBeamCursor
+        try:
+            vp = self.viewport()
+            if vp is None:
+                return
+            local_pos = vp.mapFromGlobal(QCursor.pos())
+            if not vp.rect().contains(local_pos):
+                return
+        except Exception:
+            self._set_editor_mouse_cursor(default_shape)
+            return
+
+        try:
+            if self._is_in_margin_selection_area(local_pos):
+                if self._margin_cursor:
+                    self._set_editor_mouse_cursor(self._margin_cursor)
+                else:
+                    self._set_editor_mouse_cursor(Qt.ArrowCursor)
+                return
+        except Exception:
+            pass
+
+        try:
+            cursor_at_pos = self.cursorForPosition(local_pos)
+            char_format = cursor_at_pos.charFormat()
+            is_over_link = bool(char_format.isAnchor())
+            if not is_over_link:
+                line_text = cursor_at_pos.block().text()
+                if line_text and find_http_span_at_pos(line_text, cursor_at_pos.positionInBlock()):
+                    is_over_link = True
+            if is_over_link:
+                self._set_editor_mouse_cursor(Qt.PointingHandCursor)
+                return
+            current_cursor = self.textCursor()
+            if current_cursor.hasSelection():
+                click_pos = cursor_at_pos.position()
+                if current_cursor.selectionStart() <= click_pos <= current_cursor.selectionEnd():
+                    self._set_editor_mouse_cursor(Qt.ArrowCursor)
+                    return
+        except Exception:
+            pass
+        self._set_editor_mouse_cursor(default_shape)
 
     def _is_host_window_active(self) -> bool:
         """True, если top-level окно редактора — активное foreground-окно."""
@@ -9861,11 +10333,6 @@ class TextEditor(QTextEdit):
     def mouseMoveEvent(self, event):
         """Обработка движения мыши - меняем курсор в области отступа и обрабатываем перетаскивание"""
 
-        if not self._is_host_window_active() and not self._margin_dragging:
-            self._set_editor_mouse_cursor(Qt.ArrowCursor)
-            super().mouseMoveEvent(event)
-            return
-
         # Проверяем координаты относительно виджета
         in_margin = self._is_in_margin_selection_area(event.pos())
         
@@ -10206,6 +10673,8 @@ class TextEditor(QTextEdit):
     def mousePressEvent(self, event):
         """Обработка клика мыши - выделение строки при клике в области отступа"""
 
+        self._pending_link_url = None
+
         # Явное действие пользователя: клик мышью в редакторе.
         # Разрешаем фокус в редактор на короткое время, чтобы FocusGuard не возвращал его в дерево.
         try:
@@ -10338,13 +10807,14 @@ class TextEditor(QTextEdit):
             if char_format.isAnchor():
                 url = char_format.anchorHref()
                 if url:
-                    try:
-                        # Открываем URL в браузере по умолчанию
+                    if _link_open_deferred_to_release():
+                        # Windows: откроем после отпускания, чтобы Qt получил mouseRelease.
+                        self._pending_link_url = url
+                    else:
+                        # Linux/Wayland: открываем сразу — неявный grab доживёт до release.
                         open_url_in_browser(url)
-                        event.accept()
-                        return
-                    except Exception:
-                        pass
+                    event.accept()
+                    return
             
             # Если не ссылка, проверяем, является ли текст в позиции клика ссылкой
             # Получаем строку, в которой находится курсор
@@ -10357,13 +10827,14 @@ class TextEditor(QTextEdit):
                 click_pos_in_block = click_cursor.positionInBlock()
                 # Проверяем, находится ли клик внутри гиперссылки
                 if link_start_in_block <= click_pos_in_block < link_end_in_block:
-                    try:
-                        # Открываем URL в браузере по умолчанию
+                    if _link_open_deferred_to_release():
+                        # Windows: откроем после отпускания, чтобы Qt получил mouseRelease.
+                        self._pending_link_url = url
+                    else:
+                        # Linux/Wayland: открываем сразу — неявный grab доживёт до release.
                         open_url_in_browser(url)
-                        event.accept()
-                        return
-                    except Exception:
-                        pass
+                    event.accept()
+                    return
             
             # Получаем номер строки (нумерация с 0)
             line_number = click_cursor.block().blockNumber()
@@ -10502,9 +10973,6 @@ class TextEditor(QTextEdit):
     def enterEvent(self, event):
         """Обработка входа мыши в виджет"""
         super().enterEvent(event)
-        if not self._is_host_window_active():
-            self._set_editor_mouse_cursor(Qt.ArrowCursor)
-            return
         # Проверяем, находится ли курсор над выделенным текстом
         current_cursor = self.textCursor()
         has_selection = current_cursor.hasSelection()
@@ -10529,6 +10997,16 @@ class TextEditor(QTextEdit):
         
         # Останавливаем таймер автоматической прокрутки
         self._scroll_timer.stop()
+
+        # Ссылка, нажатая в тексте (Windows): открываем после отпускания кнопки,
+        # чтобы Qt успел обработать mouseRelease и не остался с зажатой ЛКМ.
+        # На Linux/Wayland _pending_link_url не выставляется — открытие уже сделано.
+        pending_url = self._pending_link_url
+        self._pending_link_url = None
+        if pending_url and event.button() == Qt.LeftButton:
+            open_url_in_browser(pending_url)
+            event.accept()
+            return
 
         # ------------------------------------------------------------
         # Комбинации кнопок мыши для переключения вкладок
@@ -11297,6 +11775,8 @@ class JsonTreeWidget(QTreeWidget):
         self.previous_selection = None
         # Переименовать: не откатывать currentItem на previous_selection после exec_ (см. mousePressEvent ПКМ).
         self._skip_context_menu_selection_restore = False
+        # URL файла-ссылки (Windows), открываемый после mouseRelease (см. mouseDoubleClickEvent).
+        self._pending_link_url = None
         
         # Связываем сигналы
         # Не связываем customContextMenuRequested, так как обрабатываем правый клик вручную в mousePressEvent
@@ -11313,6 +11793,10 @@ class JsonTreeWidget(QTreeWidget):
         self.highlighted_item = None  # Текущий целевой элемент при перетаскивании (для отрисовки полоски)
         self.drop_indicator_position = None  # Позиция полоски: "above" или "below" элемента
         self._dnd_last_scroll_item = None  # Последний target scrollToItem во время DnD
+        # Клик ЛКМ был в «мёртвой зоне» (слева от иконки): изолируем взаимодействие
+        # от внутренней машины выделения Qt, чтобы движение мыши с зажатой кнопкой
+        # не давало диапазонное выделение («блок») от устаревшего якоря pressedIndex.
+        self._tree_dead_zone_press = False
 
         # ------------------------------------------------------------
         # Источник последнего пользовательского действия (для правил открытия вкладок)
@@ -11568,6 +12052,13 @@ class JsonTreeWidget(QTreeWidget):
         """Обработчик нажатия кнопки мыши"""
         # При правом клике выделяем элемент, по которому кликнули, перед показом меню
         if event.button() == Qt.RightButton:
+            # Клик слева от иконки (пустой отступ/ветки) — не выделяем и не показываем меню.
+            try:
+                if self._is_in_tree_dead_zone(event.pos(), self.itemAt(event.pos())):
+                    event.accept()
+                    return
+            except Exception:
+                pass
             # ------------------------------------------------------------
             # Множественное выделение: НЕ сбрасываем selection на ПКМ.
             # Показываем отдельное меню только с "Удалить" и "Экспорт".
@@ -11620,6 +12111,26 @@ class JsonTreeWidget(QTreeWidget):
         if event.button() == Qt.LeftButton:
             item = self.itemAt(event.pos())
             root_item = self.topLevelItem(0)
+
+            # Клик слева от иконки:
+            # • пустой отступ/пустое место — не выделяем и не начинаем drag;
+            # • стрелка ветки — раскрытие/сворачивание работает как раньше.
+            # В обоих случаях запрещаем ПРОТЯЖКУ (move с зажатой ЛКМ): иначе Qt может
+            # «протянуть» диапазон выделения от устаревшего якоря и выделить блок.
+            self._tree_dead_zone_press = False
+            try:
+                left_of_icon, on_branch = self._left_of_icon_hit(event.pos(), item)
+                if left_of_icon:
+                    self._tree_dead_zone_press = True
+                    if not on_branch:
+                        # Пустой отступ слева от иконки — пресс не отдаём Qt,
+                        # элемент не выделяется.
+                        event.accept()
+                        return
+                    # На стрелке ветки: пресс отдаём Qt (раскрытие/сворачивание),
+                    # но флаг выше подавит протяжку выделения в mouseMoveEvent.
+            except Exception:
+                pass
 
             # Маркируем источник навигации: мышь (для on_selection_changed)
             self._last_nav_source = "mouse"
@@ -11698,6 +12209,102 @@ class JsonTreeWidget(QTreeWidget):
         if isinstance(delegate, CustomItemDelegate):
             return delegate.rename_click_contains(self, index, pos)
         return True
+
+    def _tree_name_zone_left(self, item):
+        """Левый край зоны клика по элементу (левый край иконки/имени).
+
+        Возвращает None, если зону определить не удалось (тогда ограничение
+        не применяется и поведение остаётся прежним).
+        """
+        if not item:
+            return None
+        try:
+            index = self.indexFromItem(item, 0)
+        except Exception:
+            return None
+        if not index.isValid():
+            return None
+        try:
+            delegate = self.itemDelegate(index)
+        except Exception:
+            delegate = None
+        if isinstance(delegate, CustomItemDelegate):
+            try:
+                rect = delegate.rename_click_rect(self, index)
+                if rect.isValid():
+                    return int(rect.left())
+            except Exception:
+                pass
+        try:
+            rect = self.visualRect(index)
+            if rect.isValid():
+                return int(rect.left())
+        except Exception:
+            pass
+        return None
+
+    def _tree_branch_indicator_rect(self, item):
+        """Прямоугольник «ветки» (треугольник раскрытия) элемента с детьми.
+
+        Зона равна одному отступу indentation слева от visualRect элемента —
+        это родная зона раскрытия/сворачивания QTreeWidget. Для листьев пустой.
+        """
+        if not item:
+            return QRect()
+        try:
+            if int(item.childCount()) <= 0:
+                return QRect()
+        except Exception:
+            return QRect()
+        try:
+            index = self.indexFromItem(item, 0)
+            rect = self.visualRect(index)
+        except Exception:
+            return QRect()
+        if not rect.isValid():
+            return QRect()
+        ind = int(self.indentation())
+        if ind <= 0:
+            return QRect()
+        return QRect(int(rect.left()) - ind, int(rect.top()), ind, int(rect.height()))
+
+    def _is_in_tree_dead_zone(self, pos, item):
+        """True, если клик слева от иконки элемента (вне зоны имени и вне стрелки ветки).
+
+        Такой клик не должен выделять элемент, открывать контекстное меню,
+        начинать перетаскивание или открывать вкладку файла-ссылки.
+        """
+        if item is None or pos is None:
+            return False
+        left = self._tree_name_zone_left(item)
+        if left is None:
+            return False
+        try:
+            if int(pos.x()) >= int(left):
+                return False
+        except Exception:
+            return False
+        branch = self._tree_branch_indicator_rect(item)
+        if branch.isValid() and branch.contains(pos):
+            return False
+        return True
+
+    def _left_of_icon_hit(self, pos, item):
+        """(left_of_icon, on_branch) для позиции клика.
+
+        left_of_icon — клик левее левого края иконки/имени;
+        on_branch   — при этом позиция попадает в зону стрелки раскрытия (ветки).
+        """
+        if item is None or pos is None:
+            return (False, False)
+        try:
+            zone_left = self._tree_name_zone_left(item)
+            if zone_left is None or int(pos.x()) >= int(zone_left):
+                return (False, False)
+            branch = self._tree_branch_indicator_rect(item)
+            return (True, bool(branch.isValid() and branch.contains(pos)))
+        except Exception:
+            return (False, False)
 
     def _handle_slow_double_click_candidate(self, item):
         """Обрабатывает одиночный ЛКМ-клик как кандидат медленного двойного клика."""
@@ -12612,6 +13219,15 @@ class JsonTreeWidget(QTreeWidget):
     
     def keyPressEvent(self, event):
         """Обработчик нажатия клавиш"""
+        # Блокируем «выделить всё» (Ctrl+A / Cmd+A) для дерева.
+        # Qt по умолчанию выделяет все элементы; здесь это не нужно.
+        try:
+            if event.key() == Qt.Key_A and (event.modifiers() & Qt.ControlModifier):
+                event.accept()
+                return
+        except Exception:
+            pass
+
         # Навигация по дереву клавиатурой должна открывать элементы "как раньше" — в активной вкладке.
         try:
             nav_keys = {
@@ -12743,6 +13359,15 @@ class JsonTreeWidget(QTreeWidget):
             self._hide_truncation_tooltip()
         else:
             self._update_truncation_tooltip(event)
+
+        # Пресс был в «мёртвой зоне» (слева от иконки): не отдаём движение стандартной
+        # обработке Qt, пока кнопка удержана — иначе QAbstractItemView может протянуть
+        # выделение от устаревшего якоря pressedIndex и выделить диапазон («блок»).
+        if self._tree_dead_zone_press:
+            if event.buttons() & Qt.LeftButton:
+                event.accept()
+                return
+            self._tree_dead_zone_press = False
 
         # Проверяем, нужно ли начать перетаскивание
         if not self.dragging and self.drag_start_pos is not None and event.buttons() & Qt.LeftButton:
@@ -12936,7 +13561,14 @@ class JsonTreeWidget(QTreeWidget):
             event.accept()
             return
         
-        # Вызываем стандартную обработку только если не идет перетаскивание
+        # Стандартную обработку Qt получает ТОЛЬКО когда ЛКМ НЕ зажата.
+        # При зажатой ЛКМ QAbstractItemView может «протянуть» диапазон выделения
+        # от устаревшего якоря pressedIndex (дрожь руки между двумя кликами,
+        # двойной клик и т.п.) и выделить блок элементов. Своё drag&drop выше
+        # уже обработано, поэтому здесь движение с зажатой ЛКМ не нужно.
+        if event.buttons() & Qt.LeftButton:
+            event.accept()
+            return
         super().mouseMoveEvent(event)
 
     def leaveEvent(self, event):
@@ -12965,6 +13597,23 @@ class JsonTreeWidget(QTreeWidget):
     
     def mouseReleaseEvent(self, event):
         """Обработка отпускания кнопки мыши при перетаскивании"""
+        # Отпускание после пресса в «мёртвой зоне»: снимаем флаг. Сам release отдаём
+        # стандартной обработке — так Qt сбрасывает внутренний якорь pressedIndex.
+        if self._tree_dead_zone_press:
+            self._tree_dead_zone_press = False
+        # Ссылка из дерева (Windows): открываем после отпускания кнопки, чтобы Qt
+        # успел обработать mouseRelease (иначе остаётся зажатой ЛКМ).
+        pending_url = self._pending_link_url
+        self._pending_link_url = None
+        if pending_url and event.button() == Qt.LeftButton:
+            self.drag_start_pos = None
+            self.dragged_items = []
+            self.dragging = False
+            self._reset_slow_double_click_state()
+            open_url_in_browser(pending_url)
+            event.accept()
+            return
+
         # Если перетаскивание не началось, просто сбрасываем состояние
         if event.button() == Qt.LeftButton:
             if self.drag_start_pos is not None and not self.dragging:
@@ -13274,6 +13923,21 @@ class JsonTreeWidget(QTreeWidget):
             self._reset_slow_double_click_state()
             # Получаем элемент, по которому был двойной клик
             item = self.itemAt(event.pos())
+
+            # Двойной клик слева от иконки (пустой отступ/ветки):
+            # • пустой отступ — ничего не делаем (не выделяем, не открываем ссылку);
+            # • стрелка ветки — стандартная обработка (раскрытие/сворачивание).
+            # В обоих случаях ставим флаг, чтобы последующая протяжка (дрожь руки
+            # между кликами) не дала диапазонное выделение от старого якоря Qt.
+            try:
+                left_of_icon, on_branch = self._left_of_icon_hit(event.pos(), item)
+                if left_of_icon:
+                    self._tree_dead_zone_press = True
+                    if not on_branch:
+                        event.accept()
+                        return
+            except Exception:
+                pass
             
             if item:
                 # Проверяем, является ли элемент файлом
@@ -13290,7 +13954,22 @@ class JsonTreeWidget(QTreeWidget):
                     except Exception:
                         is_link_file = False
                     if is_link_file and self.main_window:
-                        self.main_window.open_link_item_in_shared_tab(item, also_navigate=True)
+                        # Сначала открываем вкладку; внешний URL — после mouseRelease,
+                        # чтобы внешнее приложение не «съело» отпускание кнопки.
+                        try:
+                            content = self.main_window._get_item_content_from_cache(item)
+                            if isinstance(content, list):
+                                content = content[0] if content else ""
+                            content_str = content if isinstance(content, str) else (
+                                "" if content is None else str(content))
+                            pending_url = extract_url(content_str[:4096])
+                        except Exception:
+                            pending_url = None
+                        self.main_window.open_link_item_in_shared_tab(item, also_navigate=False)
+                        if _link_open_deferred_to_release():
+                            self._pending_link_url = pending_url
+                        elif pending_url:
+                            open_url_in_browser(pending_url)
                         event.accept()
                         return
         
@@ -18530,6 +19209,16 @@ def _is_linux_wayland_session():
     return False
 
 
+def _link_open_deferred_to_release() -> bool:
+    """True — открывать ссылку только после mouseRelease.
+
+    Нужно только на Windows: внешнее приложение активируется уже на press,
+    и Qt теряет release. На Linux (X11/Wayland) композитор держит неявный
+    grab до отпускания кнопки, поэтому открываем сразу на press.
+    """
+    return sys.platform == "win32"
+
+
 def _combo_global_points_wayland(combo):
     """Глобальные координаты combobox; на Wayland mapToGlobal иногда даёт origin окна."""
     try:
@@ -22870,6 +23559,8 @@ class MainWindow(FramelessWindowMixin, QMainWindow):
                 self.favorites_bar_sandbox.favoriteRemoved.connect(self._on_sandbox_favorite_removed)
                 # Подключаем кнопку добавления
                 self.favorites_bar_sandbox.add_button.clicked.connect(self.add_to_favorites)
+                # Двойной клик по свободному месту панели избранного — аналог кнопки «Добавить в избранное»
+                self.favorites_bar_sandbox.emptyAreaDoubleClicked.connect(self.add_to_favorites)
                 # Заменяем плейсхолдер на реальную панель
                 placeholder = getattr(self, "_favorites_bar_placeholder", None)
                 if placeholder is not None:
@@ -23557,6 +24248,15 @@ class MainWindow(FramelessWindowMixin, QMainWindow):
                 fav = getattr(self, "favorites_bar_sandbox", None)
                 if fav is not None:
                     fav._refresh_favorite_exists_cache()
+            except Exception:
+                pass
+            # Возврат в окно (например, после перехода по ссылке во внешнем
+            # приложении): WindowDeactivate поставил редакторам ArrowCursor,
+            # а на Wayland Enter/mouseMove после возврата может не прийти —
+            # курсор «залипал» бы стрелкой. Пересчитываем по позиции указателя.
+            try:
+                for ed in self._iter_tab_text_editors():
+                    ed._refresh_editor_mouse_cursor()
             except Exception:
                 pass
 
@@ -28199,7 +28899,11 @@ class MainWindow(FramelessWindowMixin, QMainWindow):
             "type": "folder",
             "name": root_name,
             "cover": initial_cover,
-            "children": []
+            "children": [
+                # Системный файл copy-paste создаётся в корне нового блокнота пустым —
+                # как и любой новый файл (newlines_count пустых строк).
+                {"type": "file", "name": COPY_PASTE_NAME, "content": initial_cover},
+            ]
         }
 
         filepath = _win_qt_path(os.path.join(data_dir, sanitized))
@@ -31538,6 +32242,20 @@ class MainWindow(FramelessWindowMixin, QMainWindow):
         find_action.setShortcut("Ctrl+F")
         find_action.triggered.connect(self.show_search_dialog)
         menu.addAction(find_action)
+
+        menu.addSeparator()
+
+        # --- Copy-Paste: подменю вставки блоков из системного файла copy-paste ---
+        try:
+            def _copy_paste_copy_ui():
+                # Копирование документ не меняет — стабилизируем вид как у пункта "Копировать".
+                non_modifying_action_taken["value"] = True
+                QTimer.singleShot(0, lambda: _restore_view_state(pre_menu_view_state))
+            menu.addMenu(
+                _copy_paste_build_submenu(self, text_editor, _copy_paste_copy_ui)
+            )
+        except Exception:
+            pass
         
         menu.addSeparator()
         

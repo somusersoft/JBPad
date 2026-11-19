@@ -10,7 +10,7 @@
    <headlogo >default</>
    <dlgfontsize >s8</>
    <output >$prjpath$\build</>
-   <exename >JBPad_1.0_Windows7+_x32_setup.exe</>
+   <exename >JBPad_1.1_Windows7+_x32_setup.exe</>
    <beffile ></>
    <aftfile ></>
    <uninclude >1</>
@@ -22,7 +22,7 @@
    <volsize ></>
    <volpattern >disk%i.pak</>
    <password ></>
-   <progname >JBPad 1.0</>
+   <progname >JBPad 1.1</>
    <appname ></>
    <bl >createinstall.com/.../get-to-know-installer.html</>
    <blurl >http://www.createinstall.com/help/get-to-know-installer.html</>
