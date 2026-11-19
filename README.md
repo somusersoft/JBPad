@@ -1,4 +1,4 @@
-# JBPad 1.0
+# JBPad 1.1
 
 JBPad is a free, cross-platform, open-source text editor. Written in Python and PyQt5, it runs without installation.
 
